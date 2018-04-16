@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"github.com/golang/glog"
 	"io/ioutil"
 	"net/http"
 	"time"
@@ -30,9 +31,19 @@ import (
 
 type jenkinsSmokeTestCollector struct {
 	desc      *prometheus.Desc
+	// this could be an array of metrics if we wanted to support finer
+	// grained historical metrics ... i.e. metric instances beyond the scrapping
+	// window, etc.
 	stat      prometheus.Metric
 	namespace string
 }
+
+// also, leveraging a constant metric ala builds allows for some compare/contrast
+// of capabilities with the other monitor prototypes ... can we have concurrent
+// success/failure metrics to compare for example
+
+// also, implementing the collector interface ourselves allows for some sanity
+// checks around making sure we are getting polled
 
 // Describe implements the prometheus.Collector interface.
 func (jc *jenkinsSmokeTestCollector) Describe(ch chan<- *prometheus.Desc) {
@@ -41,20 +52,20 @@ func (jc *jenkinsSmokeTestCollector) Describe(ch chan<- *prometheus.Desc) {
 
 // Collect implements the prometheus.Collector interface.
 func (jc *jenkinsSmokeTestCollector) Collect(ch chan<- prometheus.Metric) {
-	fmt.Printf("Prometheus metric collection has called, returning %#v\n", jc.stat)
+	glog.V(2).Infof("Prometheus metric collection has called, returning %#v\n", jc.stat)
 	ch <- jc.stat
 }
 
 func (jc *jenkinsSmokeTestCollector) successMetric() {
 	lv := []string{jc.namespace, "success", ""}
 	jc.stat = prometheus.MustNewConstMetric(jc.desc, prometheus.GaugeValue, float64(time.Now().Unix()), lv...)
-	fmt.Printf("Registering successful deployment metric %#v\n", jc.stat)
+	glog.V(2).Infof("Registering successful deployment metric %#v\n", jc.stat)
 }
 
 func (jc *jenkinsSmokeTestCollector) failureMetric(errStr string) {
 	lv := []string{jc.namespace, "failure", errStr}
 	jc.stat = prometheus.MustNewConstMetric(jc.desc, prometheus.GaugeValue, float64(time.Now().Unix()), lv...)
-	fmt.Printf("Registering failed deployment metric %#v\n", jc.stat)
+	glog.V(2).Infof("Registering failed deployment metric %#v\n", jc.stat)
 }
 
 func main() {
@@ -192,13 +203,19 @@ func listPods(coreclient *corev1client.CoreV1Client, namespace string) error {
 		return err
 	}
 
-	fmt.Printf("Pods in namespace %s:\n", namespace)
+	glog.V(2).Infof("Pods in namespace %s:\n", namespace)
 	for _, pod := range pods.Items {
-		fmt.Printf("  %s\t%s\n", pod.Name, string(pod.Status.Phase))
+		glog.V(2).Infof("  %s\t%s\n", pod.Name, string(pod.Status.Phase))
 	}
 
 	return nil
 }
+
+// in this verison, we are instantiating the template once, then periodically redeploying;
+// in theory, less cpu intensive, if that was a concern (essentially only a jenkins restart)
+// could also delete all the template artifacts, then instantiate each time (jenkins deployment
+// from scratch can take a couple of minutes;
+// or we could create subprojects, then delete them
 
 func deployJenkins(appsclient *appsv1client.AppsV1Client, namespace string) error {
 	dc, err := appsclient.DeploymentConfigs(namespace).Get("jenkins",
@@ -233,12 +250,12 @@ func deployJenkins(appsclient *appsv1client.AppsV1Client, namespace string) erro
 			dc = event.Object.(*appsv1.DeploymentConfig)
 
 			for _, cond := range dc.Status.Conditions {
-				fmt.Printf("dc watch condition %#v\n", cond)
+				glog.V(2).Infof("dc watch condition %#v\n", cond)
 
 				if rcUpdated {
 					if cond.Type == appsv1.DeploymentAvailable &&
 						cond.Status == corev1.ConditionTrue {
-						fmt.Printf("new deployment available\n")
+						glog.V(2).Infof("new deployment available\n")
 						return nil
 					} else {
 						continue
@@ -249,12 +266,12 @@ func deployJenkins(appsclient *appsv1client.AppsV1Client, namespace string) erro
 					if cond.Status == corev1.ConditionTrue || cond.Status == corev1.ConditionUnknown {
 						// see problem with glide import comment above as to why we do not use apps type.go constant
 						if string(cond.Reason) == "ReplicationControllerUpdated" {
-							fmt.Printf("dc rc udpated phase 1 complete \n")
+							glog.V(2).Infof("dc rc udpated phase 1 complete \n")
 							rcUpdated = true
 							continue
 						}
 
-						fmt.Printf("dc deploy has not failed so continue watching\n")
+						glog.V(2).Infof("dc deploy has not failed so continue watching\n")
 						continue
 					}
 
@@ -263,7 +280,7 @@ func deployJenkins(appsclient *appsv1client.AppsV1Client, namespace string) erro
 
 			}
 		default:
-			fmt.Printf("got event type %#v\n", string(event.Type))
+			glog.V(2).Infof("got event type %#v\n", string(event.Type))
 		}
 	}
 
@@ -307,7 +324,7 @@ func handleHealthz(w http.ResponseWriter, r *http.Request) {
 }
 
 func runAppCreateSim(collector *jenkinsSmokeTestCollector, interval time.Duration) {
-	fmt.Printf("Jenkins smoke test loop start\n")
+	glog.V(2).Infof("Jenkins smoke test loop start\n")
 	var templateclient *templatev1client.TemplateV1Client
 	var coreclient *corev1client.CoreV1Client
 	restconfig, err := getRestConfig()
@@ -323,12 +340,12 @@ func runAppCreateSim(collector *jenkinsSmokeTestCollector, interval time.Duratio
 	if err != nil {
 		instantiated = false
 		errStr := fmt.Sprintf("instantiate error %#v", err)
-		fmt.Printf("%s\n", errStr)
+		glog.V(2).Infof("%s\n", errStr)
 		collector.failureMetric(errStr)
-		fmt.Printf("\nInitial Jenkins deployment failed $#v\n", err)
+		glog.V(2).Infof("\nInitial Jenkins deployment failed $#v\n", err)
 	} else {
 		collector.successMetric()
-		fmt.Printf("\nInitial Jenkins deployment succeeded\n")
+		glog.V(2).Infof("\nInitial Jenkins deployment succeeded\n")
 	}
 
 	listPods(coreclient, collector.namespace)
@@ -340,7 +357,7 @@ func runAppCreateSim(collector *jenkinsSmokeTestCollector, interval time.Duratio
 				restconfig, err = getRestConfig()
 				if err != nil {
 					errStr := fmt.Sprintf("restclient error %#v", err)
-					fmt.Printf("%s\n", errStr)
+					glog.V(2).Infof("%s\n", errStr)
 					collector.failureMetric(errStr)
 					continue
 				}
@@ -356,7 +373,7 @@ func runAppCreateSim(collector *jenkinsSmokeTestCollector, interval time.Duratio
 				templateclient, err = getTemplateClient(restconfig)
 				if err != nil {
 					errStr := fmt.Sprintf("templateclient error %#v", err)
-					fmt.Printf("%s\n", errStr)
+					glog.V(2).Infof("%s\n", errStr)
 					collector.failureMetric(errStr)
 					continue
 				}
@@ -366,7 +383,7 @@ func runAppCreateSim(collector *jenkinsSmokeTestCollector, interval time.Duratio
 				coreclient, err = getCoreClient(restconfig)
 				if err != nil {
 					errStr := fmt.Sprintf("coreclient error %#v", err)
-					fmt.Printf("%s\n", errStr)
+					glog.V(2).Infof("%s\n", errStr)
 					collector.failureMetric(errStr)
 					continue
 				}
@@ -377,7 +394,7 @@ func runAppCreateSim(collector *jenkinsSmokeTestCollector, interval time.Duratio
 				listPods(coreclient, collector.namespace)
 				if err != nil {
 					errStr := fmt.Sprintf("instantiate error %#v", err)
-					fmt.Printf("%s\n", errStr)
+					glog.V(2).Infof("%s\n", errStr)
 					collector.failureMetric(errStr)
 					continue
 				}
@@ -387,7 +404,7 @@ func runAppCreateSim(collector *jenkinsSmokeTestCollector, interval time.Duratio
 		appsclient, err := getAppsClient(restconfig)
 		if err != nil {
 			errStr := fmt.Sprintf("appclient error %#v", err)
-			fmt.Printf("%s\n", errStr)
+			glog.V(2).Infof("%s\n", errStr)
 			collector.failureMetric(errStr)
 			continue
 		}
@@ -396,7 +413,7 @@ func runAppCreateSim(collector *jenkinsSmokeTestCollector, interval time.Duratio
 		listPods(coreclient, collector.namespace)
 		if err != nil {
 			errStr := fmt.Sprintf("deploy error %#v", err)
-			fmt.Printf("%s\n", errStr)
+			glog.V(2).Infof("%s\n", errStr)
 			collector.failureMetric(errStr)
 			continue
 		}
@@ -410,7 +427,7 @@ func runAppCreateSim(collector *jenkinsSmokeTestCollector, interval time.Duratio
 		}
 		if err != nil {
 			errStr := fmt.Sprintf("ping error %#v", err)
-			fmt.Printf("%s\n", errStr)
+			glog.V(2).Infof("%s\n", errStr)
 			collector.failureMetric(errStr)
 			continue
 		}
